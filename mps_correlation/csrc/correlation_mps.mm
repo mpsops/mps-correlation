@@ -373,13 +373,10 @@ torch::Tensor correlation_forward_mps(
     auto input1_contig = input1.contiguous();
     auto input2_contig = input2.contiguous();
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        // Wait for any pending MPS operations to complete before running custom kernel
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuf = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         bool is_fp16 = input1_contig.scalar_type() == torch::kHalf;
         id<MTLComputePipelineState> pso = is_fp16 ? g_corr_forward_fp16 : g_corr_forward_fp32;
@@ -408,9 +405,7 @@ torch::Tensor correlation_forward_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        [encoder endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return output;
@@ -448,13 +443,10 @@ std::tuple<torch::Tensor, torch::Tensor> correlation_backward_mps(
     auto grad_input1_f = torch::zeros_like(input1_f);
     auto grad_input2_f = torch::zeros_like(input2_f);
 
+    // Use MPS stream with PyTorch's shared encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
-        // Wait for any pending MPS operations to complete
-        stream->synchronize(at::mps::SyncType::COMMIT_AND_WAIT);
-
-        id<MTLCommandBuffer> cmdBuf = [stream->commandQueue() commandBuffer];
-        id<MTLComputeCommandEncoder> encoder = [cmdBuf computeCommandEncoder];
+        id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
         int is_mult_int = is_multiply ? 1 : 0;
 
@@ -482,10 +474,7 @@ std::tuple<torch::Tensor, torch::Tensor> correlation_backward_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        [encoder endEncoding];
-
-        // Backward for input2
-        encoder = [cmdBuf computeCommandEncoder];
+        // Backward for input2 - dispatch on same encoder (multiple dispatches allowed)
         [encoder setComputePipelineState:g_corr_backward_input2_fp32];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
         [encoder setBuffer:at::native::mps::getMTLBufferStorage(input1_f) offset:0 atIndex:1];
@@ -505,10 +494,8 @@ std::tuple<torch::Tensor, torch::Tensor> correlation_backward_mps(
         [encoder setBytes:&out_width length:sizeof(int) atIndex:15];
 
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
-        [encoder endEncoding];
 
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
+        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return std::make_tuple(
