@@ -2,6 +2,7 @@
 // Used in RAFT, PWC-Net, FlowNet, etc.
 
 #include <torch/extension.h>
+#include <ATen/mps/MPSStream.h>
 #include <ATen/native/mps/OperationUtils.h>
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
@@ -173,6 +174,7 @@ kernel void correlation_forward_fp16(
 }
 
 // Backward for input1 - iterate over output and scatter gradients
+// Note: Uses atomic_float, no atomic_half in Metal, so backward always FP32
 kernel void correlation_backward_input1_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* input2 [[buffer(1)]],
@@ -367,24 +369,41 @@ torch::Tensor correlation_forward_mps(
     int neighborhood_size = 2 * max_displacement / stride2 + 1;
     int out_channels = neighborhood_size * neighborhood_size;
 
-    auto output = torch::zeros({batch, out_channels, out_height, out_width}, input1.options());
+    // Handle BF16: convert to FP32 for kernel, convert output back
+    bool is_bfloat16 = input1.scalar_type() == at::kBFloat16;
+    at::ScalarType orig_dtype = input1.scalar_type();
 
-    // Ensure inputs are contiguous
-    auto input1_contig = input1.contiguous();
-    auto input2_contig = input2.contiguous();
+    auto input1_work = input1.contiguous();
+    auto input2_work = input2.contiguous();
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Convert BF16 to FP32 for kernel execution
+    if (is_bfloat16) {
+        input1_work = input1_work.to(at::kFloat);
+        input2_work = input2_work.to(at::kFloat);
+    }
+
+    auto output = torch::zeros({batch, out_channels, out_height, out_width}, input1_work.options());
+
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> input1_buf = at::native::mps::getMTLBufferStorage(input1_work);
+    id<MTLBuffer> input2_buf = at::native::mps::getMTLBufferStorage(input2_work);
+    id<MTLBuffer> output_buf = at::native::mps::getMTLBufferStorage(output);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool is_fp16 = input1_contig.scalar_type() == torch::kHalf;
-        id<MTLComputePipelineState> pso = is_fp16 ? g_corr_forward_fp16 : g_corr_forward_fp32;
+        bool use_fp16 = input1_work.scalar_type() == at::kHalf;
+        id<MTLComputePipelineState> pso = use_fp16 ? g_corr_forward_fp16 : g_corr_forward_fp32;
 
         [encoder setComputePipelineState:pso];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(input1_contig) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(input2_contig) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(output) offset:0 atIndex:2];
+        [encoder setBuffer:input1_buf
+                    offset:input1_work.storage_offset() * input1_work.element_size() atIndex:0];
+        [encoder setBuffer:input2_buf
+                    offset:input2_work.storage_offset() * input2_work.element_size() atIndex:1];
+        [encoder setBuffer:output_buf
+                    offset:output.storage_offset() * output.element_size() atIndex:2];
 
         int is_mult_int = is_multiply ? 1 : 0;
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
@@ -405,7 +424,12 @@ torch::Tensor correlation_forward_mps(
         MTLSize threadGroupSize = MTLSizeMake(8, 8, 1);
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
+    }
+
+    // Convert output back to original dtype (BF16)
+    if (is_bfloat16) {
+        output = output.to(orig_dtype);
     }
 
     return output;
@@ -436,14 +460,23 @@ std::tuple<torch::Tensor, torch::Tensor> correlation_backward_mps(
     int neighborhood_size = 2 * max_displacement / stride2 + 1;
     int out_channels = neighborhood_size * neighborhood_size;
 
-    // Convert to float32 for backward if needed and ensure contiguous
-    auto grad_output_f = grad_output.to(torch::kFloat32).contiguous();
-    auto input1_f = input1.to(torch::kFloat32).contiguous();
-    auto input2_f = input2.to(torch::kFloat32).contiguous();
+    // Backward always uses FP32 kernel (Metal doesn't have atomic_half)
+    at::ScalarType orig_dtype = input1.scalar_type();
+
+    auto grad_output_f = grad_output.to(at::kFloat).contiguous();
+    auto input1_f = input1.to(at::kFloat).contiguous();
+    auto input2_f = input2.to(at::kFloat).contiguous();
     auto grad_input1_f = torch::zeros_like(input1_f);
     auto grad_input2_f = torch::zeros_like(input2_f);
 
-    // Use MPS stream with PyTorch's shared encoder (zero-sync)
+    // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
+    id<MTLBuffer> grad_out_buf = at::native::mps::getMTLBufferStorage(grad_output_f);
+    id<MTLBuffer> input1_buf = at::native::mps::getMTLBufferStorage(input1_f);
+    id<MTLBuffer> input2_buf = at::native::mps::getMTLBufferStorage(input2_f);
+    id<MTLBuffer> grad_input1_buf = at::native::mps::getMTLBufferStorage(grad_input1_f);
+    id<MTLBuffer> grad_input2_buf = at::native::mps::getMTLBufferStorage(grad_input2_f);
+
+    // Use PyTorch's MPS stream command encoder (zero-sync)
     @autoreleasepool {
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
@@ -452,9 +485,9 @@ std::tuple<torch::Tensor, torch::Tensor> correlation_backward_mps(
 
         // Backward for input1
         [encoder setComputePipelineState:g_corr_backward_input1_fp32];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(input2_f) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_input1_f) offset:0 atIndex:2];
+        [encoder setBuffer:grad_out_buf offset:grad_output_f.storage_offset() * grad_output_f.element_size() atIndex:0];
+        [encoder setBuffer:input2_buf offset:input2_f.storage_offset() * input2_f.element_size() atIndex:1];
+        [encoder setBuffer:grad_input1_buf offset:grad_input1_f.storage_offset() * grad_input1_f.element_size() atIndex:2];
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&channels length:sizeof(int) atIndex:4];
         [encoder setBytes:&height length:sizeof(int) atIndex:5];
@@ -476,9 +509,9 @@ std::tuple<torch::Tensor, torch::Tensor> correlation_backward_mps(
 
         // Backward for input2 - dispatch on same encoder (multiple dispatches allowed)
         [encoder setComputePipelineState:g_corr_backward_input2_fp32];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_output_f) offset:0 atIndex:0];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(input1_f) offset:0 atIndex:1];
-        [encoder setBuffer:at::native::mps::getMTLBufferStorage(grad_input2_f) offset:0 atIndex:2];
+        [encoder setBuffer:grad_out_buf offset:grad_output_f.storage_offset() * grad_output_f.element_size() atIndex:0];
+        [encoder setBuffer:input1_buf offset:input1_f.storage_offset() * input1_f.element_size() atIndex:1];
+        [encoder setBuffer:grad_input2_buf offset:grad_input2_f.storage_offset() * grad_input2_f.element_size() atIndex:2];
         [encoder setBytes:&batch length:sizeof(int) atIndex:3];
         [encoder setBytes:&channels length:sizeof(int) atIndex:4];
         [encoder setBytes:&height length:sizeof(int) atIndex:5];
@@ -495,12 +528,12 @@ std::tuple<torch::Tensor, torch::Tensor> correlation_backward_mps(
 
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
-        // Don't endEncoding/commit - PyTorch manages encoder lifecycle
+        // No endEncoding/commit - PyTorch manages encoder lifecycle
     }
 
     return std::make_tuple(
-        grad_input1_f.to(input1.scalar_type()),
-        grad_input2_f.to(input2.scalar_type())
+        grad_input1_f.to(orig_dtype),
+        grad_input2_f.to(orig_dtype)
     );
 }
 
