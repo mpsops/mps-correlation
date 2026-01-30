@@ -11,6 +11,7 @@ static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
 static id<MTLComputePipelineState> g_corr_forward_fp32 = nil;
 static id<MTLComputePipelineState> g_corr_forward_fp16 = nil;
+static id<MTLComputePipelineState> g_corr_forward_bf16 = nil;
 static id<MTLComputePipelineState> g_corr_backward_input1_fp32 = nil;
 static id<MTLComputePipelineState> g_corr_backward_input2_fp32 = nil;
 
@@ -173,6 +174,81 @@ kernel void correlation_forward_fp16(
     output[b * out_channels * out_height * out_width + c * out_height * out_width + h * out_width + w] = half(sum);
 }
 
+// Forward correlation kernel - BF16 (native bfloat16 support, no conversion overhead)
+kernel void correlation_forward_bf16(
+    device const bfloat* input1 [[buffer(0)]],
+    device const bfloat* input2 [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant int& batch [[buffer(3)]],
+    constant int& channels [[buffer(4)]],
+    constant int& height [[buffer(5)]],
+    constant int& width [[buffer(6)]],
+    constant int& kernel_size [[buffer(7)]],
+    constant int& max_displacement [[buffer(8)]],
+    constant int& stride1 [[buffer(9)]],
+    constant int& stride2 [[buffer(10)]],
+    constant int& pad_size [[buffer(11)]],
+    constant int& is_multiply [[buffer(12)]],
+    constant int& out_channels [[buffer(13)]],
+    constant int& out_height [[buffer(14)]],
+    constant int& out_width [[buffer(15)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    int w = gid.x;
+    int h = gid.y;
+    int bc = gid.z;
+
+    int b = bc / out_channels;
+    int c = bc % out_channels;
+
+    if (w >= out_width || h >= out_height || b >= batch) return;
+
+    int neighborhood_size = 2 * max_displacement / stride2 + 1;
+    int dy = c / neighborhood_size - max_displacement / stride2;
+    int dx = c % neighborhood_size - max_displacement / stride2;
+
+    dy *= stride2;
+    dx *= stride2;
+
+    int x1 = w * stride1 + max_displacement - pad_size;
+    int y1 = h * stride1 + max_displacement - pad_size;
+
+    int x2 = x1 + dx;
+    int y2 = y1 + dy;
+
+    float sum = 0.0f;  // Accumulate in FP32 for precision
+    int k_rad = kernel_size / 2;
+
+    for (int kc = 0; kc < channels; kc++) {
+        for (int ky = -k_rad; ky <= k_rad; ky++) {
+            for (int kx = -k_rad; kx <= k_rad; kx++) {
+                int py1 = y1 + ky;
+                int px1 = x1 + kx;
+                int py2 = y2 + ky;
+                int px2 = x2 + kx;
+
+                float v1 = 0.0f, v2 = 0.0f;
+
+                if (py1 >= 0 && py1 < height && px1 >= 0 && px1 < width) {
+                    v1 = float(input1[b * channels * height * width + kc * height * width + py1 * width + px1]);
+                }
+                if (py2 >= 0 && py2 < height && px2 >= 0 && px2 < width) {
+                    v2 = float(input2[b * channels * height * width + kc * height * width + py2 * width + px2]);
+                }
+
+                if (is_multiply) {
+                    sum += v1 * v2;
+                } else {
+                    float diff = v1 - v2;
+                    sum += diff * diff;
+                }
+            }
+        }
+    }
+
+    output[b * out_channels * out_height * out_width + c * out_height * out_width + h * out_width + w] = bfloat(sum);
+}
+
 // Backward for input1 - iterate over output and scatter gradients
 // Note: Uses atomic_float, no atomic_half in Metal, so backward always FP32
 kernel void correlation_backward_input1_fp32(
@@ -331,11 +407,13 @@ static void ensure_initialized() {
 
     id<MTLFunction> corr_fwd_fp32 = [g_library newFunctionWithName:@"correlation_forward_fp32"];
     id<MTLFunction> corr_fwd_fp16 = [g_library newFunctionWithName:@"correlation_forward_fp16"];
+    id<MTLFunction> corr_fwd_bf16 = [g_library newFunctionWithName:@"correlation_forward_bf16"];
     id<MTLFunction> corr_bwd_in1 = [g_library newFunctionWithName:@"correlation_backward_input1_fp32"];
     id<MTLFunction> corr_bwd_in2 = [g_library newFunctionWithName:@"correlation_backward_input2_fp32"];
 
     g_corr_forward_fp32 = [g_device newComputePipelineStateWithFunction:corr_fwd_fp32 error:&error];
     g_corr_forward_fp16 = [g_device newComputePipelineStateWithFunction:corr_fwd_fp16 error:&error];
+    g_corr_forward_bf16 = [g_device newComputePipelineStateWithFunction:corr_fwd_bf16 error:&error];
     g_corr_backward_input1_fp32 = [g_device newComputePipelineStateWithFunction:corr_bwd_in1 error:&error];
     g_corr_backward_input2_fp32 = [g_device newComputePipelineStateWithFunction:corr_bwd_in2 error:&error];
 }
@@ -369,24 +447,15 @@ torch::Tensor correlation_forward_mps(
     int neighborhood_size = 2 * max_displacement / stride2 + 1;
     int out_channels = neighborhood_size * neighborhood_size;
 
-    // Handle BF16: convert to FP32 for kernel, convert output back
-    bool is_bfloat16 = input1.scalar_type() == at::kBFloat16;
-    at::ScalarType orig_dtype = input1.scalar_type();
+    // Native support for FP32, FP16, BF16 - no conversion needed for forward
+    auto input1_contig = input1.contiguous();
+    auto input2_contig = input2.contiguous();
 
-    auto input1_work = input1.contiguous();
-    auto input2_work = input2.contiguous();
-
-    // Convert BF16 to FP32 for kernel execution
-    if (is_bfloat16) {
-        input1_work = input1_work.to(at::kFloat);
-        input2_work = input2_work.to(at::kFloat);
-    }
-
-    auto output = torch::zeros({batch, out_channels, out_height, out_width}, input1_work.options());
+    auto output = torch::zeros({batch, out_channels, out_height, out_width}, input1_contig.options());
 
     // Get Metal buffers BEFORE calling commandEncoder() (important for zero-sync!)
-    id<MTLBuffer> input1_buf = at::native::mps::getMTLBufferStorage(input1_work);
-    id<MTLBuffer> input2_buf = at::native::mps::getMTLBufferStorage(input2_work);
+    id<MTLBuffer> input1_buf = at::native::mps::getMTLBufferStorage(input1_contig);
+    id<MTLBuffer> input2_buf = at::native::mps::getMTLBufferStorage(input2_contig);
     id<MTLBuffer> output_buf = at::native::mps::getMTLBufferStorage(output);
 
     // Use PyTorch's MPS stream command encoder (zero-sync)
@@ -394,14 +463,21 @@ torch::Tensor correlation_forward_mps(
         auto stream = at::mps::getCurrentMPSStream();
         id<MTLComputeCommandEncoder> encoder = stream->commandEncoder();
 
-        bool use_fp16 = input1_work.scalar_type() == at::kHalf;
-        id<MTLComputePipelineState> pso = use_fp16 ? g_corr_forward_fp16 : g_corr_forward_fp32;
+        // Select kernel based on dtype - native support for all types
+        id<MTLComputePipelineState> pso;
+        if (input1_contig.scalar_type() == at::kHalf) {
+            pso = g_corr_forward_fp16;
+        } else if (input1_contig.scalar_type() == at::kBFloat16) {
+            pso = g_corr_forward_bf16;
+        } else {
+            pso = g_corr_forward_fp32;
+        }
 
         [encoder setComputePipelineState:pso];
         [encoder setBuffer:input1_buf
-                    offset:input1_work.storage_offset() * input1_work.element_size() atIndex:0];
+                    offset:input1_contig.storage_offset() * input1_contig.element_size() atIndex:0];
         [encoder setBuffer:input2_buf
-                    offset:input2_work.storage_offset() * input2_work.element_size() atIndex:1];
+                    offset:input2_contig.storage_offset() * input2_contig.element_size() atIndex:1];
         [encoder setBuffer:output_buf
                     offset:output.storage_offset() * output.element_size() atIndex:2];
 
@@ -425,11 +501,6 @@ torch::Tensor correlation_forward_mps(
         [encoder dispatchThreads:gridSize threadsPerThreadgroup:threadGroupSize];
 
         // No endEncoding/commit - PyTorch manages encoder lifecycle
-    }
-
-    // Convert output back to original dtype (BF16)
-    if (is_bfloat16) {
-        output = output.to(orig_dtype);
     }
 
     return output;
