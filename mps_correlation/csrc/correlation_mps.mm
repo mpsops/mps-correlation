@@ -19,6 +19,23 @@ static const char* METAL_SHADER = R"(
 #include <metal_stdlib>
 using namespace metal;
 
+// Atomic float add using compare-and-swap (works on all Metal versions)
+// This is the standard workaround when atomic_float is not available
+inline void atomic_add_float(device atomic_uint* addr, float value) {
+    uint expected = atomic_load_explicit(addr, memory_order_relaxed);
+    float current_val = as_type<float>(expected);
+    float new_val = current_val + value;
+    uint new_bits = as_type<uint>(new_val);
+
+    while (!atomic_compare_exchange_weak_explicit(
+        addr, &expected, new_bits,
+        memory_order_relaxed, memory_order_relaxed)) {
+        current_val = as_type<float>(expected);
+        new_val = current_val + value;
+        new_bits = as_type<uint>(new_val);
+    }
+}
+
 // Forward correlation kernel
 // Reference: https://github.com/ClementPinard/Pytorch-Correlation-extension
 // Conceptually works on zero-padded inputs. Coordinates are in padded space,
@@ -254,7 +271,7 @@ kernel void correlation_forward_bf16(
 kernel void correlation_backward_input1_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* input2 [[buffer(1)]],
-    device atomic_float* grad_input1 [[buffer(2)]],
+    device atomic_uint* grad_input1 [[buffer(2)]],
     constant int& batch [[buffer(3)]],
     constant int& channels [[buffer(4)]],
     constant int& height [[buffer(5)]],
@@ -312,7 +329,7 @@ kernel void correlation_backward_input1_fp32(
 
                     if (is_multiply) {
                         int idx = b * channels * height * width + c * height * width + y1 * width + x1;
-                        atomic_fetch_add_explicit(&grad_input1[idx], grad_val * v2, memory_order_relaxed);
+                        atomic_add_float(&grad_input1[idx], grad_val * v2);
                     }
                 }
             }
@@ -324,7 +341,7 @@ kernel void correlation_backward_input1_fp32(
 kernel void correlation_backward_input2_fp32(
     device const float* grad_output [[buffer(0)]],
     device const float* input1 [[buffer(1)]],
-    device atomic_float* grad_input2 [[buffer(2)]],
+    device atomic_uint* grad_input2 [[buffer(2)]],
     constant int& batch [[buffer(3)]],
     constant int& channels [[buffer(4)]],
     constant int& height [[buffer(5)]],
@@ -382,7 +399,7 @@ kernel void correlation_backward_input2_fp32(
 
                     if (is_multiply) {
                         int idx = b * channels * height * width + c * height * width + y2 * width + x2;
-                        atomic_fetch_add_explicit(&grad_input2[idx], grad_val * v1, memory_order_relaxed);
+                        atomic_add_float(&grad_input2[idx], grad_val * v1);
                     }
                 }
             }
