@@ -6,6 +6,12 @@
 #include <ATen/native/mps/OperationUtils.h>
 #include <Metal/Metal.h>
 #include <Foundation/Foundation.h>
+#include <mutex>
+#include <atomic>
+
+// Thread-safe Metal state
+static std::mutex g_init_mutex;
+static std::atomic<bool> g_initialized{false};
 
 static id<MTLDevice> g_device = nil;
 static id<MTLLibrary> g_library = nil;
@@ -14,6 +20,13 @@ static id<MTLComputePipelineState> g_corr_forward_fp16 = nil;
 static id<MTLComputePipelineState> g_corr_forward_bf16 = nil;
 static id<MTLComputePipelineState> g_corr_backward_input1_fp32 = nil;
 static id<MTLComputePipelineState> g_corr_backward_input2_fp32 = nil;
+
+// Helper to check for integer overflow
+static void check_size_overflow(int64_t value, const char* name) {
+    constexpr int64_t INT32_LIMIT = static_cast<int64_t>(std::numeric_limits<int32_t>::max());
+    TORCH_CHECK(value <= INT32_LIMIT,
+        name, " (", value, ") exceeds int32 limit for Metal kernel dispatch");
+}
 
 static const char* METAL_SHADER = R"(
 #include <metal_stdlib>
@@ -409,9 +422,22 @@ kernel void correlation_backward_input2_fp32(
 )";
 
 static void ensure_initialized() {
-    if (g_device != nil) return;
+    // Fast path: already initialized
+    if (g_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Slow path: need to initialize
+    std::lock_guard<std::mutex> lock(g_init_mutex);
+
+    // Double-check after acquiring lock
+    if (g_initialized.load(std::memory_order_relaxed)) {
+        return;
+    }
 
     g_device = MTLCreateSystemDefaultDevice();
+    TORCH_CHECK(g_device != nil, "Failed to create Metal device");
+
     NSError* error = nil;
 
     NSString* source = [NSString stringWithUTF8String:METAL_SHADER];
@@ -433,6 +459,14 @@ static void ensure_initialized() {
     g_corr_forward_bf16 = [g_device newComputePipelineStateWithFunction:corr_fwd_bf16 error:&error];
     g_corr_backward_input1_fp32 = [g_device newComputePipelineStateWithFunction:corr_bwd_in1 error:&error];
     g_corr_backward_input2_fp32 = [g_device newComputePipelineStateWithFunction:corr_bwd_in2 error:&error];
+
+    TORCH_CHECK(g_corr_forward_fp32 != nil, "Failed to create correlation_forward_fp32 pipeline");
+    TORCH_CHECK(g_corr_forward_fp16 != nil, "Failed to create correlation_forward_fp16 pipeline");
+    TORCH_CHECK(g_corr_forward_bf16 != nil, "Failed to create correlation_forward_bf16 pipeline");
+    TORCH_CHECK(g_corr_backward_input1_fp32 != nil, "Failed to create correlation_backward_input1_fp32 pipeline");
+    TORCH_CHECK(g_corr_backward_input2_fp32 != nil, "Failed to create correlation_backward_input2_fp32 pipeline");
+
+    g_initialized.store(true, std::memory_order_release);
 }
 
 torch::Tensor correlation_forward_mps(
@@ -447,9 +481,17 @@ torch::Tensor correlation_forward_mps(
 ) {
     ensure_initialized();
 
+    // Device validation
     TORCH_CHECK(input1.device().type() == torch::kMPS, "input1 must be on MPS");
     TORCH_CHECK(input2.device().type() == torch::kMPS, "input2 must be on MPS");
     TORCH_CHECK(input1.sizes() == input2.sizes(), "input1 and input2 must have same shape");
+
+    // Parameter validation
+    TORCH_CHECK(kernel_size > 0, "kernel_size must be positive, got ", kernel_size);
+    TORCH_CHECK(max_displacement >= 0, "max_displacement must be non-negative, got ", max_displacement);
+    TORCH_CHECK(stride1 > 0, "stride1 must be positive, got ", stride1);
+    TORCH_CHECK(stride2 > 0, "stride2 must be positive, got ", stride2);
+    TORCH_CHECK(pad_size >= 0, "pad_size must be non-negative, got ", pad_size);
 
     int batch = input1.size(0);
     int channels = input1.size(1);

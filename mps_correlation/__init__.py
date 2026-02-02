@@ -10,8 +10,12 @@ from torch import nn, Tensor
 from torch.autograd import Function
 from typing import Optional, Tuple
 import math
+import threading
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
+
+# Thread-safe library loading
+_lib_lock = threading.Lock()
 
 
 def _load_library():
@@ -38,10 +42,42 @@ _lib_cache = None
 
 
 def _get_lib():
+    """Thread-safe library loading."""
     global _lib_cache
     if _lib_cache is None:
-        _lib_cache = _load_library()
+        with _lib_lock:
+            # Double-check after acquiring lock
+            if _lib_cache is None:
+                _lib_cache = _load_library()
     return _lib_cache
+
+
+def _validate_params(
+    kernel_size: int,
+    max_displacement: int,
+    stride1: int,
+    stride2: int,
+    pad_size: int,
+) -> None:
+    """Validate correlation parameters."""
+    if kernel_size <= 0:
+        raise ValueError(f"kernel_size must be positive, got {kernel_size}")
+    if max_displacement < 0:
+        raise ValueError(f"max_displacement must be non-negative, got {max_displacement}")
+    if stride1 <= 0:
+        raise ValueError(f"stride1 must be positive, got {stride1}")
+    if stride2 <= 0:
+        raise ValueError(f"stride2 must be positive, got {stride2}")
+    if pad_size < 0:
+        raise ValueError(f"pad_size must be non-negative, got {pad_size}")
+
+
+def _check_tensor_device(tensor: Tensor, name: str, expected_device: torch.device) -> None:
+    """Check that tensor is on the expected device."""
+    if tensor.device != expected_device:
+        raise ValueError(
+            f"{name} must be on same device as input1 ({expected_device}), got {tensor.device}"
+        )
 
 
 class _CorrelationFunction(Function):
@@ -59,6 +95,9 @@ class _CorrelationFunction(Function):
         pad_size: int,
         is_multiply: bool,
     ) -> Tensor:
+        # Device validation
+        _check_tensor_device(input2, "input2", input1.device)
+
         ctx.save_for_backward(input1, input2)
         ctx.kernel_size = kernel_size
         ctx.max_displacement = max_displacement
@@ -79,6 +118,11 @@ class _CorrelationFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor):
         input1, input2 = ctx.saved_tensors
+
+        # Device validation for backward
+        if not grad_output.device.type == "mps":
+            raise ValueError(f"grad_output must be on MPS device, got {grad_output.device}")
+
         lib = _get_lib()
 
         grad_input1, grad_input2 = lib.correlation_backward(
@@ -109,18 +153,24 @@ def correlation(
     Args:
         input1: First feature map (N, C, H, W)
         input2: Second feature map (N, C, H, W)
-        kernel_size: Size of the correlation kernel
-        max_displacement: Maximum displacement for correlation search
-        stride1: Stride for input1
-        stride2: Stride for input2 (displacement stride)
-        pad_size: Padding size
+        kernel_size: Size of the correlation kernel (must be positive)
+        max_displacement: Maximum displacement for correlation search (must be non-negative)
+        stride1: Stride for input1 (must be positive)
+        stride2: Stride for input2/displacement stride (must be positive)
+        pad_size: Padding size (must be non-negative)
         is_multiply: If True, use multiplication. If False, use subtraction.
 
     Returns:
         Correlation volume (N, D*D, H, W) where D = 2*max_displacement/stride2 + 1
+
+    Raises:
+        ValueError: If tensors not on MPS or parameters invalid.
     """
     if input1.device.type != "mps":
         raise ValueError(f"Input must be on MPS device, got {input1.device}")
+
+    # Validate parameters
+    _validate_params(kernel_size, max_displacement, stride1, stride2, pad_size)
 
     return _CorrelationFunction.apply(
         input1, input2,

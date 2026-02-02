@@ -9,6 +9,100 @@ from mps_correlation import correlation, Correlation, CorrBlock, is_available
 
 print(f"MPS available: {is_available()}")
 
+
+# =============================================================================
+# Validation Tests
+# =============================================================================
+
+def test_kernel_size_validation():
+    """Test that kernel_size<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+
+    input1 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    input2 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+
+    try:
+        correlation(input1, input2, kernel_size=0, max_displacement=4, stride1=1, stride2=1, pad_size=4)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "kernel_size" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  kernel_size=0 correctly rejected")
+        return True
+    return False
+
+
+def test_stride1_validation():
+    """Test that stride1<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+
+    input1 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    input2 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+
+    try:
+        correlation(input1, input2, kernel_size=1, max_displacement=4, stride1=0, stride2=1, pad_size=4)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "stride1" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  stride1=0 correctly rejected")
+        return True
+    return False
+
+
+def test_stride2_validation():
+    """Test that stride2<=0 raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+
+    input1 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    input2 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+
+    try:
+        correlation(input1, input2, kernel_size=1, max_displacement=4, stride1=1, stride2=0, pad_size=4)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "stride2" in str(e).lower() and "positive" in str(e).lower()
+        print(f"  stride2=0 correctly rejected")
+        return True
+    return False
+
+
+def test_pad_size_validation():
+    """Test that negative pad_size raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+
+    input1 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    input2 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+
+    try:
+        correlation(input1, input2, kernel_size=1, max_displacement=4, stride1=1, stride2=1, pad_size=-1)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "pad_size" in str(e).lower() and "non-negative" in str(e).lower()
+        print(f"  negative pad_size correctly rejected")
+        return True
+    return False
+
+
+def test_device_mismatch():
+    """Test that input2 on different device raises ValueError"""
+    torch.manual_seed(42)
+    B, C, H, W = 1, 4, 8, 8
+
+    input1 = torch.randn(B, C, H, W, device='mps', dtype=torch.float32)
+    input2 = torch.randn(B, C, H, W, device='cpu', dtype=torch.float32)  # CPU!
+
+    try:
+        correlation(input1, input2, kernel_size=1, max_displacement=4, stride1=1, stride2=1, pad_size=4)
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "device" in str(e).lower()
+        print(f"  device mismatch correctly rejected")
+        return True
+    return False
+
 def test_forward(dtype, name):
     """Test forward pass"""
     torch.manual_seed(42)
@@ -233,6 +327,13 @@ if __name__ == "__main__":
     print("=" * 50)
 
     all_ok = True
+
+    print("\n0. Validation tests:")
+    all_ok &= test_kernel_size_validation()
+    all_ok &= test_stride1_validation()
+    all_ok &= test_stride2_validation()
+    all_ok &= test_pad_size_validation()
+    all_ok &= test_device_mismatch()
 
     print("\n1. Forward pass:")
     all_ok &= test_forward(torch.float32, "FP32")
